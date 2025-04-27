@@ -1,7 +1,9 @@
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::State,
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -17,7 +19,6 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{RwLock, mpsc},
-    task::JoinSet,
 };
 
 use loro::{ExportMode, LoroDoc, VersionVector};
@@ -39,63 +40,99 @@ enum Event {
     Read,
 }
 
+const MAX_RETRY: usize = 100;
+
 async fn handler(
     state: Arc<RwLock<AppState>>,
-    mut rx: mpsc::Receiver<Event>,
+    rx: mpsc::Receiver<Event>,
     remotes: Vec<SocketAddr>,
     path: PathBuf,
 ) -> Result<()> {
-    let local_write_flag = {
-        let s = state.read().await;
-        s.local_write_flag.clone()
-    };
+    async fn inner_handler(
+        state: Arc<RwLock<AppState>>,
+        mut rx: mpsc::Receiver<Event>,
+        remotes: Vec<SocketAddr>,
+        path: PathBuf,
+    ) -> Result<()> {
+        let local_write_flag = {
+            let s = state.read().await;
+            s.local_write_flag.clone()
+        };
 
-    while let Some(event) = rx.recv().await {
-        dbg!(&event);
-        match event {
-            Event::Write => {
-                local_write_flag.store(true, Ordering::SeqCst);
-                let content = (*state).read().await.doc.get_text("content").to_string();
+        while let Some(event) = rx.recv().await {
+            dbg!(&event);
+            match event {
+                Event::Write => {
+                    // localに書き込み
+                    local_write_flag.store(true, Ordering::SeqCst);
+                    let content = (*state).read().await.doc.get_text("content").to_string();
 
-                let mut file = File::create(&path).await?;
+                    let mut file = File::create(&path).await?;
 
-                file.write_all(content.as_bytes()).await?;
+                    file.write_all(content.as_bytes()).await?;
 
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                local_write_flag.store(false, Ordering::SeqCst);
-            }
-            Event::Read => {
-                let text = (*state).write().await.doc.get_text("content");
-
-                let mut file = File::open(&path).await?;
-                let mut contents = String::new();
-                file.read_to_string(&mut contents).await?;
-
-                text.update(&contents, Default::default())?;
-
-                // ちゃんと制御できてると信じたい。時間の問題
-                if local_write_flag.load(Ordering::SeqCst) {
-                    continue;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    local_write_flag.store(false, Ordering::SeqCst);
                 }
-                let mut set: JoinSet<Result<()>> = JoinSet::new();
+                Event::Read => {
+                    // localをReadして送信
+                    eprintln!("reading content");
+                    let text = { (*state).write().await.doc.get_text("content") };
+                    eprintln!("read");
 
-                // ちょっとパフォーマンス落ちるけどまあ
-                for ri in remotes.clone() {
-                    let state = state.clone();
-                    set.spawn(async move {
+                    eprintln!("opening file");
+                    let mut file = File::open(&path).await?;
+                    let mut contents = String::new();
+                    eprintln!("reading file");
+                    file.read_to_string(&mut contents).await?;
+                    eprintln!("read");
+
+                    text.update(&contents, Default::default())?;
+
+                    // ちゃんと制御できてると信じたい。時間の問題
+                    if local_write_flag.load(Ordering::SeqCst) {
+                        eprintln!("local_write_flagが立ってた");
+                        continue;
+                    }
+
+                    for ri in &remotes {
                         let client = reqwest::Client::new();
 
                         eprintln!("fetching version");
 
-                        let version: VersionVector = reqwest::get(format!("http://{ri}/version"))
-                            .await?
-                            .json()
-                            .await?;
+                        let version: VersionVector = {
+                            let mut resp = None;
+                            let addr = dbg!(format!("http://{ri}/version"));
+
+                            for _ in 0..MAX_RETRY {
+                                match reqwest::get(&addr).await {
+                                    Ok(r) => {
+                                        // 成功したら即座に返す
+                                        resp = Some(r);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Attempt failed with error: {}. Retrying in 1 second…",
+                                            e
+                                        );
+                                        // 1秒間隔で再試行
+                                        tokio::time::sleep(Duration::from_secs(1)).await; // tokio の sleep で非同期待機 :contentReference[oaicite:0]{index=0}
+                                    }
+                                }
+                            }
+
+                            resp.expect("そのアドレスほんとうにopenしてる?")
+                        }
+                        .json()
+                        .await?;
 
                         let update = Update {
-                            bytes: (*state).read().await.doc.export(ExportMode::Updates {
-                                from: Cow::Borrowed(&version),
-                            })?,
+                            bytes: {
+                                (*state).read().await.doc.export(ExportMode::Updates {
+                                    from: Cow::Borrowed(&version),
+                                })?
+                            },
                         };
 
                         eprintln!("sending updates");
@@ -105,15 +142,17 @@ async fn handler(
                             .json(&update)
                             .send()
                             .await?;
-
-                        Ok(())
-                    });
+                    }
                 }
-
-                let _ = set.join_all().await;
             }
         }
+        Ok(())
     }
+
+    if let Err(err) = inner_handler(state, rx, remotes, path).await {
+        eprintln!("{err:?}")
+    }
+
     Ok(())
 }
 
@@ -122,10 +161,15 @@ async fn watcher(tx: mpsc::Sender<Event>, path: PathBuf, local_write_flag: Arc<A
         if !local_write_flag.load(Ordering::SeqCst) && event.is_ok() {
             match event.as_ref().unwrap().kind {
                 EventKind::Modify(_) | EventKind::Remove(_) => {
-                    let _ = tx.blocking_send(Event::Read);
+                    eprintln!("Detecting Write");
+                    eprintln!("Sending Read");
+                    if let Err(err) = tx.blocking_send(Event::Read) {
+                        eprintln!("{err:?}");
+                    }
+                    eprintln!("sent");
                 }
                 _ => {
-                    dbg!(&event);
+                    // dbg!(&event);
                 }
             }
         } else {
@@ -145,6 +189,8 @@ async fn watcher(tx: mpsc::Sender<Event>, path: PathBuf, local_write_flag: Arc<A
 
 #[derive(Parser, Debug)]
 struct Args {
+    #[arg(long, short)]
+    clone_from: Option<SocketAddr>,
     #[arg(long, short, default_values_t = Vec::<SocketAddr>::new())]
     remotes: Vec<SocketAddr>,
     #[arg(long, short)]
@@ -166,14 +212,21 @@ async fn main() -> Result<()> {
         doc: {
             let doc = LoroDoc::default();
 
-            let text = doc.get_text("content");
+            if let Some(addr) = args.clone_from {
+                let resp = reqwest::get(format!("http://{addr}/all")).await?;
+                let bytes: Bytes = resp.bytes().await?;
+                let data: Vec<u8> = bytes.to_vec();
 
-            let mut file = File::open(&args.file).await?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents).await?;
+                doc.import(&data)?;
+            } else {
+                let text = doc.get_text("content");
 
-            text.update(&contents, Default::default())?;
+                let mut file = File::open(&args.file).await?;
+                let mut contents = String::new();
+                file.read_to_string(&mut contents).await?;
 
+                text.update(&contents, Default::default())?;
+            }
             doc
         },
         tx: tx.clone(),
@@ -197,6 +250,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/version", get(version))
+        .route("/all", get(all))
         .route("/update", post(update))
         .with_state(state.clone());
 
@@ -219,19 +273,37 @@ async fn version(State(state): State<Arc<RwLock<AppState>>>) -> (StatusCode, Jso
     (StatusCode::OK, Json(r.doc.oplog_vv()))
 }
 
+async fn all(State(state): State<Arc<RwLock<AppState>>>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        (*state)
+            .read()
+            .await
+            .doc
+            .export(ExportMode::Snapshot)
+            .unwrap(),
+    )
+}
+
 async fn update(
     State(state): State<Arc<RwLock<AppState>>>,
     Json(payload): Json<Update>,
 ) -> StatusCode {
     eprintln!("update");
-    let w = (*state).write().await;
+    let w = (*state).read().await;
 
     if let Err(err) = w.doc.import(&payload.bytes) {
         eprintln!("{err:?}");
 
         StatusCode::NOT_ACCEPTABLE
     } else {
-        let _ = w.tx.send(Event::Write).await;
+        eprintln!("imported");
+        eprintln!("sending Event::Write");
+        if let Err(err) = w.tx.try_send(Event::Write) {
+            eprintln!("{err:?}");
+        }
+
+        eprintln!("sent write");
 
         StatusCode::OK
     }
