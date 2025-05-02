@@ -79,9 +79,25 @@ async fn handler(
                     eprintln!("reading content");
                     let text = { (*state).write().await.doc.get_text("content") };
                     eprintln!("read");
-
                     eprintln!("opening file");
-                    let mut file = File::open(&path).await?;
+                    let mut file = {
+                        let mut file = None;
+
+                        for _ in 0..MAX_RETRY {
+                            match File::open(&path).await {
+                                Ok(r) => {
+                                    // 成功したら即座に返す
+                                    file = Some(r);
+                                }
+                                Err(e) => {
+                                    eprintln!("Attempt failed with error: {}. Retrying", e);
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                            }
+                        }
+
+                        file.expect("ファイルがない")
+                    };
                     let mut contents = String::new();
                     eprintln!("reading file");
                     file.read_to_string(&mut contents).await?;
@@ -117,7 +133,7 @@ async fn handler(
                                             e
                                         );
                                         // 1秒間隔で再試行
-                                        tokio::time::sleep(Duration::from_secs(1)).await; // tokio の sleep で非同期待機 :contentReference[oaicite:0]{index=0}
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
                                     }
                                 }
                             }
@@ -160,7 +176,7 @@ async fn watcher(tx: mpsc::Sender<Event>, path: PathBuf, local_write_flag: Arc<A
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         if !local_write_flag.load(Ordering::SeqCst) && event.is_ok() {
             match event.as_ref().unwrap().kind {
-                EventKind::Modify(_) | EventKind::Remove(_) => {
+                EventKind::Modify(_) => {
                     eprintln!("Detecting Write");
                     eprintln!("Sending Read");
                     if let Err(err) = tx.blocking_send(Event::Read) {
